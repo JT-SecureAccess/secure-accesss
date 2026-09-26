@@ -1,0 +1,7 @@
+{
+  "name":"jusclick-tenant-provider-adapter",
+  "private":true,
+  "type":"module",
+  "scripts":{"start":"node server.mjs"},
+  "dependencies":{"convex":"^1.46.0","mysql2":"^3.24.4","pg":"^8.16.3"}
+}
