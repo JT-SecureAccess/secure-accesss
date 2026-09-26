@@ -3,7 +3,9 @@ import pg from "pg"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { readFile } from "node:fs/promises"
+import { fileURLToPath } from "node:url"
 const exec=promisify(execFile)
+const convexBin=fileURLToPath(new URL("./node_modules/.bin/convex",import.meta.url))
 const sleep=ms=>new Promise(r=>setTimeout(r,ms))
 const required=(v,n)=>{if(!v)throw Object.assign(new Error("Missing "+n),{code:"INVALID_PROVIDER_CONFIGURATION",retryable:false})}
 const slug=v=>v.toLowerCase().replace(/[^a-z0-9-]+/g,"-").replace(/^-+|-+$/g,"").slice(0,48)||"tenant"
@@ -13,10 +15,10 @@ function jsonSecret(input){const s=input.secret;if(!s||typeof s!=="object"||Arra
 class ConvexProvider{
  async api(path,input,options={}){const s=jsonSecret(input);required(s.managementToken,"Convex management token");required(s.teamId,"Convex team ID");return request("https://api.convex.dev/v1"+path,{...options,headers:{authorization:"Bearer "+s.managementToken,"content-type":"application/json",...(options.headers||{})}})}
  async create(input){const s=jsonSecret(input);if(input.reference&&s.deployKey)return {backendReference:input.reference,deployKey:s.deployKey,deploymentName:s.deploymentName,region:input.region||"default"};const d=await this.api("/teams/"+encodeURIComponent(s.teamId)+"/create_project",input,{method:"POST",body:JSON.stringify({projectName:"Jusclick · "+input.tenantSlug,deploymentType:"prod",deploymentRegion:input.region||undefined})});const ref=d.deploymentUrl||d.deployment?.url;const deploymentName=d.deploymentName||d.deployment?.name;required(ref,"Convex deployment URL");required(deploymentName,"Convex deployment name");const key=await request("https://api.convex.dev/v1/deployments/"+encodeURIComponent(deploymentName)+"/create_deploy_key",{method:"POST",headers:{authorization:"Bearer "+s.managementToken,"content-type":"application/json"},body:JSON.stringify({name:"jusclick-provisioner"})});const deployKey=key.deployKey||key.token||key.adminKey;required(deployKey,"Convex deploy key");return {backendReference:ref,deploymentName,deployKey,region:d.region||input.region||"default"}}
- async configure(r,input){required(input.tenantAuthIssuer,"Tenant auth issuer");for(const [k,v] of Object.entries({TENANT_AUTH_ISSUER:input.tenantAuthIssuer,TENANT_AUTH_APPLICATION_ID:"convex"}))await exec("../node_modules/.bin/convex",["env","set",k,String(v)],{cwd:"/app/tenant-template",env:{...process.env,CONVEX_DEPLOY_KEY:r.deployKey}});return r}
- async migrate(r){await exec("../node_modules/.bin/convex",["deploy"],{cwd:"/app/tenant-template",env:{...process.env,CONVEX_DEPLOY_KEY:r.deployKey},maxBuffer:20*1024*1024});return r}
- async bootstrap(r,input){const args=JSON.stringify({companyName:input.companyName,ownerSubject:input.ownerSubject||input.ownerEmail,ownerName:input.ownerName||input.ownerEmail,ownerEmail:input.ownerEmail});await exec("../node_modules/.bin/convex",["run","tenant:bootstrap",args],{cwd:"/app/tenant-template",env:{...process.env,CONVEX_DEPLOY_KEY:r.deployKey},maxBuffer:5*1024*1024});return r}
- async health(r){await exec("../node_modules/.bin/convex",["run","health:check","{}"],{cwd:"/app/tenant-template",env:{...process.env,CONVEX_DEPLOY_KEY:r.deployKey},maxBuffer:5*1024*1024});return {ok:true}}
+ async configure(r,input){required(input.tenantAuthIssuer,"Tenant auth issuer");for(const [k,v] of Object.entries({TENANT_AUTH_ISSUER:input.tenantAuthIssuer,TENANT_AUTH_APPLICATION_ID:"convex"}))await exec(convexBin,["env","set",k,String(v)],{cwd:"/app/tenant-template",env:{...process.env,CONVEX_DEPLOY_KEY:r.deployKey}});return r}
+ async migrate(r){await exec(convexBin,["deploy"],{cwd:"/app/tenant-template",env:{...process.env,CONVEX_DEPLOY_KEY:r.deployKey},maxBuffer:20*1024*1024});return r}
+ async bootstrap(r,input){const args=JSON.stringify({companyName:input.companyName,ownerSubject:input.ownerSubject||input.ownerEmail,ownerName:input.ownerName||input.ownerEmail,ownerEmail:input.ownerEmail});await exec(convexBin,["run","tenant:bootstrap",args],{cwd:"/app/tenant-template",env:{...process.env,CONVEX_DEPLOY_KEY:r.deployKey},maxBuffer:5*1024*1024});return r}
+ async health(r){await exec(convexBin,["run","health:check","{}"],{cwd:"/app/tenant-template",env:{...process.env,CONVEX_DEPLOY_KEY:r.deployKey},maxBuffer:5*1024*1024});return {ok:true}}
  async provision(input,jobId,progress){let r=await progress("CREATING",null,await this.create(input));r=await progress("INITIALIZING",r,await this.configure(r,input));r=await progress("MIGRATING",r,await this.migrate(r,input));r=await progress("BOOTSTRAPPING",r,await this.bootstrap(r,input));await progress("VERIFYING",r,await this.health(r,input));return {backendReference:r.backendReference,region:r.region,schemaVersion:input.templateVersion||"1",deploymentName:r.deploymentName}}
 }
 
