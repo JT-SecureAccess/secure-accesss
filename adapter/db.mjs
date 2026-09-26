@@ -1,4 +1,5 @@
 import pg from "pg"
+import crypto from "node:crypto"
 
 const {Pool}=pg
 let pool
@@ -13,6 +14,9 @@ function getPool(){
 }
 
 function json(value){return value==null?null:JSON.stringify(value)}
+function key(){const s=process.env.TENANT_ADAPTER_SECRET;if(!s)throw new Error("TENANT_ADAPTER_SECRET is required");return crypto.createHash("sha256").update(s).digest()}
+function protect(value){if(value==null)return null;const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv("aes-256-gcm",key(),iv);const ciphertext=Buffer.concat([cipher.update(JSON.stringify(value),"utf8"),cipher.final()]);return JSON.stringify({v:1,iv:iv.toString("base64url"),tag:cipher.getAuthTag().toString("base64url"),data:ciphertext.toString("base64url")})}
+export function unprotect(value){if(!value)return null;const x=typeof value==="string"?JSON.parse(value):value;if(x.v!==1)throw new Error("Unsupported protected job payload");const decipher=crypto.createDecipheriv("aes-256-gcm",key(),Buffer.from(x.iv,"base64url"));decipher.setAuthTag(Buffer.from(x.tag,"base64url"));return JSON.parse(Buffer.concat([decipher.update(Buffer.from(x.data,"base64url")),decipher.final()]).toString("utf8"))}
 
 export async function migrateStore(){
   await getPool().query(`
@@ -54,7 +58,7 @@ export async function createJob(input,jobId){
      values($1,$2,$3,$4,$5,'QUEUED','QUEUED',0,$6,now(),now())
      on conflict(idempotency_key) do nothing
      returning *`,
-    [jobId,input.idempotencyKey,input.tenantId,input.tenantSlug,input.provider,json(input)]
+    [jobId,input.idempotencyKey,input.tenantId,input.tenantSlug,input.provider,protect(input)]
   )
   if(rows[0])return rows[0]
   return await getJobByIdempotency(input.idempotencyKey)
