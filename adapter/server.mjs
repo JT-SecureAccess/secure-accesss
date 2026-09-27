@@ -23,8 +23,8 @@ function publicJob(row){
 }
 async function execute(jobId,inputOverride=null){
   const job=await claimJob(jobId); if(!job)return
+  const provisionInput=inputOverride??job.input
   try{
-    const provisionInput=inputOverride??job.input
     if(!provisionInput?.secret)throw Object.assign(new Error("Provider credentials must be supplied for each provisioning execution."),{code:"INVALID_PROVIDER_CONFIGURATION",retryable:false})
     const result=await runProvision(provisionInput,jobId,async(step,resource)=>{await updateJob(jobId,{status:"RUNNING",step,resource});return resource})
     await updateJob(jobId,{status:"SUCCEEDED",step:"ACTIVE",resource:result,result})
