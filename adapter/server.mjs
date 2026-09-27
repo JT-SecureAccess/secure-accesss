@@ -1,6 +1,6 @@
 import http from "node:http"
 import crypto from "node:crypto"
-import { migrateStore,getJobById,getJobByIdempotency,createJob,claimJob,updateJob,deleteJob,closeStore } from "./db.mjs"
+import { migrateStore,recoverInterruptedJobs,getJobById,getJobByIdempotency,createJob,claimJob,updateJob,deleteJob,closeStore } from "./db.mjs"
 import { runProvision } from "./providers.mjs"
 
 const port=Number(process.env.PORT||8787)
@@ -22,9 +22,9 @@ function publicJob(row){
   return {jobId:row.job_id,tenantId:row.tenant_id,provider:row.provider,status:row.status,step:row.step,attempt:row.attempt,resource:safeResource,result:row.result,errorCode:row.error_code,errorMessage:row.error_message,createdAt:row.created_at,updatedAt:row.updated_at,startedAt:row.started_at,completedAt:row.completed_at}
 }
 async function execute(jobId,inputOverride=null){
-  const job=await claimJob(jobId);if(!job)return
-  const provisionInput=inputOverride??job.input
+  const job=await claimJob(jobId); if(!job)return
   try{
+    const provisionInput=inputOverride??job.input
     if(!provisionInput?.secret)throw Object.assign(new Error("Provider credentials must be supplied for each provisioning execution."),{code:"INVALID_PROVIDER_CONFIGURATION",retryable:false})
     const result=await runProvision(provisionInput,jobId,async(step,resource)=>{await updateJob(jobId,{status:"RUNNING",step,resource});return resource})
     await updateJob(jobId,{status:"SUCCEEDED",step:"ACTIVE",resource:result,result})
@@ -38,7 +38,7 @@ async function main(){
   await migrateStore()
   const server=http.createServer(async(req,res)=>{
     try{
-      if(req.method==="GET"&&req.url==="/health")return json(res,200,{ok:true,service:"jusclick-tenant-provider-adapter",version:4})
+      if(req.method==="GET"&&req.url==="/health")return json(res,200,{ok:true,service:"jusclick-tenant-provider-adapter",version:3})
       if(!authorized(req))return json(res,401,{ok:false,message:"Unauthorized"})
       const url=new URL(req.url,"http://adapter")
       if(req.method==="POST"&&url.pathname==="/v1/tenant/provision"){
