@@ -1,90 +1,70 @@
 import pg from "pg"
-import crypto from "node:crypto"
 
-const {Pool}=pg
-let pool
+const { Pool } = pg
+const databaseUrl = process.env.ADAPTER_DATABASE_URL
+if (!databaseUrl) throw new Error("ADAPTER_DATABASE_URL is required")
 
-function getPool(){
-  if(!pool){
-    const url=process.env.ADAPTER_DATABASE_URL
-    if(!url)throw new Error("ADAPTER_DATABASE_URL is required")
-    pool=new Pool({connectionString:url,ssl:process.env.ADAPTER_DATABASE_SSL==="false"?false:{rejectUnauthorized:false},max:5})
-  }
-  return pool
-}
+export const pool = new Pool({
+  connectionString: databaseUrl,
+  max: Number(process.env.ADAPTER_DB_POOL_SIZE || 10),
+  ssl: process.env.ADAPTER_DATABASE_SSL === "false" ? false : {
+    rejectUnauthorized: process.env.ADAPTER_DATABASE_SSL_REJECT_UNAUTHORIZED !== "false",
+    ...(process.env.ADAPTER_DATABASE_SSL_CA ? { ca: process.env.ADAPTER_DATABASE_SSL_CA } : {}),
+  },
+})
 
-function json(value){return value==null?null:JSON.stringify(value)}
-function key(){const s=process.env.TENANT_ADAPTER_SECRET;if(!s)throw new Error("TENANT_ADAPTER_SECRET is required");return crypto.createHash("sha256").update(s).digest()}
-function protect(value){if(value==null)return null;const iv=crypto.randomBytes(12),cipher=crypto.createCipheriv("aes-256-gcm",key(),iv);const ciphertext=Buffer.concat([cipher.update(JSON.stringify(value),"utf8"),cipher.final()]);return JSON.stringify({v:1,iv:iv.toString("base64url"),tag:cipher.getAuthTag().toString("base64url"),data:ciphertext.toString("base64url")})}
-export function unprotect(value){if(!value)return null;const x=typeof value==="string"?JSON.parse(value):value;if(x.v!==1)throw new Error("Unsupported protected job payload");const decipher=crypto.createDecipheriv("aes-256-gcm",key(),Buffer.from(x.iv,"base64url"));decipher.setAuthTag(Buffer.from(x.tag,"base64url"));return JSON.parse(Buffer.concat([decipher.update(Buffer.from(x.data,"base64url")),decipher.final()]).toString("utf8"))}
-
-export async function migrateStore(){
-  await getPool().query(`
-    create table if not exists adapter_jobs (
-      job_id text primary key,
-      idempotency_key text not null unique,
-      tenant_id text not null,
-      tenant_slug text not null,
-      provider text not null,
-      status text not null,
-      step text,
-      attempt integer not null default 0,
-      input jsonb,
-      resource jsonb,
-      result jsonb,
-      errors jsonb,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now(),
-      completed_at timestamptz
+export async function migrateStore() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS adapter_jobs (
+      job_id TEXT PRIMARY KEY,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      tenant_id TEXT NOT NULL,
+      tenant_slug TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      status TEXT NOT NULL,
+      step TEXT NOT NULL,
+      attempt INTEGER NOT NULL DEFAULT 0,
+      input JSONB NOT NULL,
+      resource JSONB,
+      result JSONB,
+      error_code TEXT,
+      error_message TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      started_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ
     );
-    create index if not exists adapter_jobs_tenant_status on adapter_jobs(tenant_id,status);
+    CREATE INDEX IF NOT EXISTS adapter_jobs_tenant_idx ON adapter_jobs(tenant_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS adapter_jobs_status_idx ON adapter_jobs(status, updated_at);
   `)
 }
-
-export async function getJobById(jobId){
-  const {rows}=await getPool().query("select * from adapter_jobs where job_id=$1",[jobId])
-  return rows[0]??null
+export async function getJobById(id) { const r=await pool.query("SELECT * FROM adapter_jobs WHERE job_id=$1",[id]); return r.rows[0]||null }
+export async function getJobByIdempotency(key) { const r=await pool.query("SELECT * FROM adapter_jobs WHERE idempotency_key=$1",[key]); return r.rows[0]||null }
+export async function createJob(input,jobId) {
+  const { secret: _secret, ...safeInput } = input
+  const r=await pool.query(`
+    INSERT INTO adapter_jobs(job_id,idempotency_key,tenant_id,tenant_slug,provider,status,step,input,attempt,started_at)
+    VALUES ($1,$2,$3,$4,$5,'QUEUED','QUEUED',$6,0,NOW())
+    ON CONFLICT (idempotency_key) DO UPDATE SET updated_at=NOW()
+    RETURNING *
+  `,[jobId,input.idempotencyKey,input.tenantId,input.tenantSlug,input.provider,JSON.stringify(safeInput)])
+  return r.rows[0]
 }
-
-export async function getJobByIdempotency(key){
-  const {rows}=await getPool().query("select * from adapter_jobs where idempotency_key=$1",[key])
-  return rows[0]??null
+export async function claimJob(jobId) {
+  const r=await pool.query("UPDATE adapter_jobs SET status='RUNNING',step='CREATING',attempt=attempt+1,updated_at=NOW() WHERE job_id=$1 AND status IN ('QUEUED','RETRY_WAIT','FAILED_RETRYABLE') RETURNING *",[jobId])
+  return r.rows[0]||null
 }
-
-export async function createJob(input,jobId){
-  const {rows}=await getPool().query(
-    `insert into adapter_jobs
-      (job_id,idempotency_key,tenant_id,tenant_slug,provider,status,step,attempt,input,created_at,updated_at)
-     values($1,$2,$3,$4,$5,'QUEUED','QUEUED',0,$6,now(),now())
-     on conflict(idempotency_key) do nothing
-     returning *`,
-    [jobId,input.idempotencyKey,input.tenantId,input.tenantSlug,input.provider,protect(input)]
-  )
-  if(rows[0])return rows[0]
-  return await getJobByIdempotency(input.idempotencyKey)
+export async function updateJob(jobId,patch) {
+  const map={status:"status",step:"step",resource:"resource",result:"result",errorCode:"error_code",errorMessage:"error_message",startedAt:"started_at",completedAt:"completed_at"}
+  const parts=[],values=[]; let i=1
+  for(const [k,v] of Object.entries(patch)){if(!map[k])continue;parts.push(map[k]+"=$"+i++);values.push(v&&typeof v==="object"&&!(v instanceof Date)?JSON.stringify(v):v)}
+  if(!parts.length)return getJobById(jobId)
+  parts.push("updated_at=NOW()");values.push(jobId)
+  const r=await pool.query("UPDATE adapter_jobs SET "+parts.join(",")+" WHERE job_id=$"+i+" RETURNING *",values)
+  return r.rows[0]||null
 }
-
-export async function claimJob(jobId){
-  const {rows}=await getPool().query(
-    `update adapter_jobs
-     set status='RUNNING',step='RUNNING',attempt=attempt+1,updated_at=now()
-     where job_id=$1 and status in ('QUEUED','RETRY')
-     returning *`,[jobId])
-  return rows[0]??null
+export async function deleteJob(jobId) {
+  const r=await pool.query("DELETE FROM adapter_jobs WHERE job_id=$1 AND status IN ('FAILED_RETRYABLE','FAILED_FATAL') RETURNING job_id",[jobId])
+  return Boolean(r.rows[0])
 }
-
-export async function updateJob(jobId,patch){
-  const fields=[],values=[],allowed={status:"status",step:"step",resource:"resource",result:"result",errors:"errors"}
-  for(const [k,v] of Object.entries(patch??{})){
-    if(allowed[k]){fields.push(allowed[k]+"=$"+(values.length+1));values.push(typeof v==="object"?json(v):v)}
-  }
-  if(!fields.length)return getJobById(jobId)
-  fields.push("updated_at=now()")
-  values.push(jobId)
-  const {rows}=await getPool().query(`update adapter_jobs set ${fields.join(",")} where job_id=$${values.length} returning *`,values)
-  return rows[0]??null
-}
-
-export async function closeStore(){
-  if(pool){await pool.end();pool=null}
-}
+export async function closeStore(){await pool.end()}
