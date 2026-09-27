@@ -4,11 +4,14 @@ const { Pool } = pg
 const databaseUrl = process.env.ADAPTER_DATABASE_URL
 if (!databaseUrl) throw new Error("ADAPTER_DATABASE_URL is required")
 
+const sslMode = process.env.ADAPTER_DATABASE_SSL
+const rejectUnauthorized = process.env.ADAPTER_DATABASE_SSL_REJECT_UNAUTHORIZED === "true"
+
 export const pool = new Pool({
   connectionString: databaseUrl,
   max: Number(process.env.ADAPTER_DB_POOL_SIZE || 10),
-  ssl: process.env.ADAPTER_DATABASE_SSL === "false" ? false : {
-    rejectUnauthorized: process.env.ADAPTER_DATABASE_SSL_REJECT_UNAUTHORIZED !== "false",
+  ssl: sslMode === "false" ? false : {
+    rejectUnauthorized,
     ...(process.env.ADAPTER_DATABASE_SSL_CA ? { ca: process.env.ADAPTER_DATABASE_SSL_CA } : {}),
   },
 })
